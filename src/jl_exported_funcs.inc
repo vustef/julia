@@ -375,6 +375,8 @@
     XX(jl_printf) \
     XX(jl_print_backtrace) \
     XX(jl_process_events) \
+    XX(jl_sizeof_uvloop) \
+    XX(jl_uv_loop_init) \
     XX(jl_profile_clear_data) \
     XX(jl_profile_delay_nsec) \
     XX(jl_profile_get_data) \

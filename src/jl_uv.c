@@ -218,6 +218,16 @@ JL_DLLEXPORT int jl_process_events(void)
     return 0;
 }
 
+JL_DLLEXPORT int jl_sizeof_uvloop(void)
+{
+    return sizeof(uv_loop_t);
+}
+
+JL_DLLEXPORT int jl_uv_loop_init(uv_loop_t *loop)
+{
+    return uv_loop_init(loop);
+}
+
 JL_DLLEXPORT int jl_process_events2(uv_loop_t *loop)
 {
     jl_task_t *ct = jl_current_task;

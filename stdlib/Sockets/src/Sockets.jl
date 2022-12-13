@@ -88,8 +88,8 @@ end
 function TCPSocket(; delay=true)
     tcp = TCPSocket(Libc.malloc(Base._sizeof_uv_tcp), StatusUninit)
     af_spec = delay ? 0 : 2   # AF_UNSPEC is 0, AF_INET is 2
-    eventLoop = Libc.malloc(Base._sizeof_uv_loop)
-    uv_loop_init(eventLoop);
+    eventLoop = Libc.malloc(sizeof_uvloop())
+    uv_loop_init(eventLoop)
     iolock_begin()
     err = ccall(:uv_tcp_init_ex, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cuint),
                 eventLoop, tcp.handle, af_spec)
@@ -967,7 +967,7 @@ function Base.uvfinalize(uv::TCPSocket)
     uv.handle == C_NULL && return
     #iolock_begin()
     if uv.handle != C_NULL
-        disassociate_julia_struct(uv.handle) # not going to call the usual close hooks
+        Base.disassociate_julia_struct(uv.handle) # not going to call the usual close hooks
         if uv.status != StatusUninit
             close(uv)
         else
@@ -1276,6 +1276,14 @@ end
 
 function process_events(s::TCPSocket)
     return ccall(:jl_process_events2, Int32, (Ptr{Cvoid},), s.eventLoop)
+end
+
+function sizeof_uvloop()
+    return ccall(:jl_sizeof_uvloop, Int32, ())
+end
+
+function uv_loop_init(l::Ptr{Cvoid})
+    return ccall(:jl_uv_loop_init, Int32, (Ptr{Cvoid},), l)
 end
 
 # domain sockets

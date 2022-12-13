@@ -2013,6 +2013,10 @@ typedef int jl_uv_os_fd_t;
 
 JL_DLLEXPORT int jl_process_events(void);
 
+JL_DLLEXPORT int jl_sizeof_uvloop(void);
+
+JL_DLLEXPORT int jl_uv_loop_init(struct uv_loop_s *loop);
+
 JL_DLLEXPORT int jl_process_events2(struct uv_loop_s *loop);
 
 JL_DLLEXPORT struct uv_loop_s *jl_global_event_loop(void);
