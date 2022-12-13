@@ -46,7 +46,7 @@ void jl_wake_libuv(void)
 
 jl_mutex_t jl_uv_mutex;
 
-void jl_init_uv(void) // TODO @vustef: Do the locking per TCPSocket, and add these callbacks
+void jl_init_uv(void)
 {
     uv_async_init(jl_io_loop, &signal_async, jl_signal_async_cb);
     JL_MUTEX_INIT(&jl_uv_mutex); // a file-scope initializer can be used instead
@@ -67,19 +67,6 @@ void JL_UV_LOCK(void)
     }
 }
 
-// void JL_UV_LOCK(uv_loop_t, socklock* sl)
-// {
-//     if (jl_mutex_trylock(&jl_uv_mutex)) {
-//     }
-//     else {
-//         jl_atomic_fetch_add_relaxed(&jl_uv_n_waiters, 1);
-//         jl_fence(); // [^store_buffering_2]
-//         jl_wake_libuv();
-//         JL_LOCK(&jl_uv_mutex);
-//         jl_atomic_fetch_add_relaxed(&jl_uv_n_waiters, -1);
-//     }
-// }
-
 JL_DLLEXPORT void jl_iolock_begin(void)
 {
     JL_UV_LOCK();
@@ -93,13 +80,51 @@ JL_DLLEXPORT void jl_iolock_end(void)
 struct socklock_s {
   jl_mutex_t jl_uv_mutex;
   _Atomic(int) jl_uv_n_waiters;
+  uv_async_t signal_async;
 };
 
 typedef struct socklock_s socklock;
 
-JL_DLLEXPORT void jl_init_socklock(socklock* socklock)
+static void jl_signal_async_cb_sock(uv_async_t *hdl)
 {
-    socklock->jl_uv_n_waiters = 0;
+    // This should abort the current loop and the julia code it returns to
+    // or the safepoint in the callers of `uv_run` should throw the exception.
+    (void)hdl;
+    uv_stop(jl_io_loop); // TODO @vustef: need to access correct loop here...
+}
+
+void jl_init_uv_sock(uv_loop_t* loop, socklock* sl)
+{
+    uv_async_init(loop, &(sl->signal_async), jl_signal_async_cb_sock);
+    JL_MUTEX_INIT(&(sl->jl_uv_mutex)); // a file-scope initializer can be used instead
+}
+
+void jl_wake_libuv_sock(socklock* sl)
+{
+    uv_async_send(&(sl->signal_async));
+}
+
+void JL_UV_LOCK_SOCK(uv_loop_t* loop, socklock* sl)
+{
+    if (jl_mutex_trylock(&(sl->jl_uv_mutex))) {
+    }
+    else {
+        jl_atomic_fetch_add_relaxed(&(sl->jl_uv_n_waiters), 1);
+        jl_fence(); // [^store_buffering_2]
+        jl_wake_libuv_sock(sl);
+        JL_LOCK(&jl_uv_mutex);
+        jl_atomic_fetch_add_relaxed(&(sl->jl_uv_n_waiters), -1);
+    }
+}
+
+void JL_UV_UNLOCK_SOCK(socklock* sl) {
+    JL_UNLOCK(&(sl->jl_uv_mutex));
+}
+
+JL_DLLEXPORT void jl_init_socklock(uv_loop_t* loop, socklock* sl)
+{
+    sl->jl_uv_n_waiters = 0;
+    jl_init_uv_sock(loop, sl);
 }
 
 JL_DLLEXPORT int jl_sizeof_socklock(void)
@@ -107,14 +132,14 @@ JL_DLLEXPORT int jl_sizeof_socklock(void)
     return sizeof(struct socklock_s);
 }
 
-JL_DLLEXPORT void jl_socklock_begin(uv_loop_t* loop, socklock* socklock)
+JL_DLLEXPORT void jl_socklock_begin(uv_loop_t* loop, socklock* sl)
 {
-    // JL_UV_LOCK(loop, socklock); // TODO @vustef
+    JL_UV_LOCK_SOCK(loop, sl);
 }
 
-JL_DLLEXPORT void jl_socklock_end(uv_loop_t* loop, socklock* socklock)
+JL_DLLEXPORT void jl_socklock_end(socklock* sl)
 {
-    // JL_UV_UNLOCK(loop, soocklock); // TODO @vustef
+    JL_UV_UNLOCK_SOCK(sl);
 }
 
 

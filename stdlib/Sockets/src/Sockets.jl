@@ -79,8 +79,8 @@ mutable struct TCPSocket <: LibuvStream
                 nothing,
                 ReentrantLock(),
                 Base.DEFAULT_READ_BUFFER_SZ,
-                undef,
-                undef)
+                Ptr{Nothing}(),
+                Ptr{Nothing}())
         associate_julia_struct(tcp.handle, tcp)
         finalizer(uvfinalize, tcp)
         return tcp
@@ -88,15 +88,15 @@ mutable struct TCPSocket <: LibuvStream
 end
 
 function Base.iolock_begin(s::TCPSocket)
-    ccall(:jl_socklock_begin, Cvoid, (Ptr{Cvoid},), s.eventLoop)
+    ccall(:jl_socklock_begin, Cvoid, (Ptr{Cvoid},Ptr{Cvoid},), s.eventLoop, s.socklock)
 end
 
 function Base.iolock_end(s::TCPSocket)
-    ccall(:jl_socklock_end, Cvoid, (Ptr{Cvoid},), s.eventLoop)
+    ccall(:jl_socklock_end, Cvoid, (Ptr{Cvoid},), s.socklock)
 end
 
-function init_socklock(socklock::Ptr{Cvoid})
-    ccall(:jl_init_socklock, Cvoid, (Ptr{Cvoid},), socklock)
+function init_socklock(loop::Ptr{Cvoid}, socklock::Ptr{Cvoid})
+    ccall(:jl_init_socklock, Cvoid, (Ptr{Cvoid}, Ptr{Cvoid},), loop, socklock)
 end
 
 function sizeof_socklock()
@@ -112,10 +112,10 @@ function TCPSocket(; delay=true)
     tcp.eventLoop = eventLoop
 
     socklock = Libc.malloc(sizeof_socklock())
-    init_socklock(socklock)
+    init_socklock(eventLoop, socklock)
     tcp.socklock = socklock
 
-    iolock_begin(eventLoop, socklock)
+    iolock_begin(eventLoop, socklock) # TODO @vustef: Replace commented locks with these.
     err = ccall(:uv_tcp_init_ex, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cuint),
                 eventLoop, tcp.handle, af_spec)
     uv_error("failed to create tcp socket", err)
