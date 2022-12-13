@@ -1,0 +1,45 @@
+diff --git a/src/threading.c b/src/threading.c
+index e33d22c245..c5413519a4 100644
+--- a/src/threading.c
++++ b/src/threading.c
+@@ -699,6 +699,7 @@ void _jl_mutex_wait(jl_task_t *self, jl_mutex_t *lock, int safepoint)
+         lock->count++;
+         return;
+     }
++    int loop_count = 0;
+     while (1) {
+         if (owner == NULL && jl_atomic_cmpswap(&lock->owner, &owner, self)) {
+             lock->count = 1;
+@@ -707,7 +708,7 @@ void _jl_mutex_wait(jl_task_t *self, jl_mutex_t *lock, int safepoint)
+         if (safepoint) {
+             jl_gc_safepoint_(self->ptls);
+         }
+-        if (jl_running_under_rr(0)) {
++        if (loop_count >= 100 || jl_running_under_rr(0)) {
+             // when running under `rr`, use system mutexes rather than spin locking
+             uv_mutex_lock(&tls_lock);
+             if (jl_atomic_load_relaxed(&lock->owner))
+@@ -716,6 +717,7 @@ void _jl_mutex_wait(jl_task_t *self, jl_mutex_t *lock, int safepoint)
+         }
+         jl_cpu_pause();
+         owner = jl_atomic_load_relaxed(&lock->owner);
++        ++loop_count;
+     }
+ }
+ 
+@@ -779,12 +781,9 @@ void _jl_mutex_unlock_nogc(jl_mutex_t *lock)
+     if (--lock->count == 0) {
+         jl_atomic_store_release(&lock->owner, (jl_task_t*)NULL);
+         jl_cpu_wake();
+-        if (jl_running_under_rr(0)) {
+-            // when running under `rr`, use system mutexes rather than spin locking
+-            uv_mutex_lock(&tls_lock);
+-            uv_cond_broadcast(&cond);
+-            uv_mutex_unlock(&tls_lock);
+-        }
++        uv_mutex_lock(&tls_lock);
++        uv_cond_broadcast(&cond);
++        uv_mutex_unlock(&tls_lock);
+     }
+ #endif
+ }
