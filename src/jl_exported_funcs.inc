@@ -269,6 +269,10 @@
     XX(jl_in_threaded_region) \
     XX(jl_iolock_begin) \
     XX(jl_iolock_end) \
+    XX(jl_socklock_begin) \
+    XX(jl_sizeof_socklock) \
+    XX(jl_init_socklock) \
+    XX(jl_socklock_end) \
     XX(jl_ios_buffer_n) \
     XX(jl_ios_fd) \
     XX(jl_ios_get_nbyte_int) \

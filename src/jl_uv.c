@@ -67,6 +67,19 @@ void JL_UV_LOCK(void)
     }
 }
 
+// void JL_UV_LOCK(uv_loop_t, socklock* sl)
+// {
+//     if (jl_mutex_trylock(&jl_uv_mutex)) {
+//     }
+//     else {
+//         jl_atomic_fetch_add_relaxed(&jl_uv_n_waiters, 1);
+//         jl_fence(); // [^store_buffering_2]
+//         jl_wake_libuv();
+//         JL_LOCK(&jl_uv_mutex);
+//         jl_atomic_fetch_add_relaxed(&jl_uv_n_waiters, -1);
+//     }
+// }
+
 JL_DLLEXPORT void jl_iolock_begin(void)
 {
     JL_UV_LOCK();
@@ -75,6 +88,33 @@ JL_DLLEXPORT void jl_iolock_begin(void)
 JL_DLLEXPORT void jl_iolock_end(void)
 {
     JL_UV_UNLOCK();
+}
+
+struct socklock_s {
+  jl_mutex_t jl_uv_mutex;
+  _Atomic(int) jl_uv_n_waiters;
+};
+
+typedef struct socklock_s socklock;
+
+JL_DLLEXPORT void jl_init_socklock(socklock* socklock)
+{
+    socklock->jl_uv_n_waiters = 0;
+}
+
+JL_DLLEXPORT int jl_sizeof_socklock(void)
+{
+    return sizeof(struct socklock_s);
+}
+
+JL_DLLEXPORT void jl_socklock_begin(uv_loop_t* loop, socklock* socklock)
+{
+    // JL_UV_LOCK(loop, socklock); // TODO @vustef
+}
+
+JL_DLLEXPORT void jl_socklock_end(uv_loop_t* loop, socklock* socklock)
+{
+    // JL_UV_UNLOCK(loop, soocklock); // TODO @vustef
 }
 
 

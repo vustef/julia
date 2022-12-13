@@ -2001,6 +2001,7 @@ extern int had_exception;
 struct uv_loop_s;
 struct uv_handle_s;
 struct uv_stream_s;
+struct socklock_s;
 #ifdef _OS_WINDOWS_
 typedef HANDLE jl_uv_os_fd_t;
 #else
@@ -2016,6 +2017,14 @@ JL_DLLEXPORT int jl_process_events(void);
 JL_DLLEXPORT int jl_sizeof_uvloop(void);
 
 JL_DLLEXPORT int jl_uv_loop_init(struct uv_loop_s *loop);
+
+JL_DLLEXPORT void jl_socklock_begin(struct uv_loop_s *loop, struct socklock_s *socklock);
+
+JL_DLLEXPORT void jl_socklock_end(struct uv_loop_s *loop, struct socklock_s *socklock);
+
+JL_DLLEXPORT int jl_sizeof_socklock(void);
+
+JL_DLLEXPORT void jl_init_socklock(struct socklock_s *socklock);
 
 JL_DLLEXPORT int jl_process_events2(struct uv_loop_s *loop);
 

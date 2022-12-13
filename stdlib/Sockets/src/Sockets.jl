@@ -67,6 +67,7 @@ mutable struct TCPSocket <: LibuvStream
     lock::ReentrantLock # advisory lock
     throttle::Int
     eventLoop::Ptr{Cvoid}
+    socklock::Ptr{Cvoid}
 
     function TCPSocket(handle::Ptr{Cvoid}, status)
         tcp = new(
@@ -77,11 +78,29 @@ mutable struct TCPSocket <: LibuvStream
                 nothing,
                 nothing,
                 ReentrantLock(),
-                Base.DEFAULT_READ_BUFFER_SZ)
+                Base.DEFAULT_READ_BUFFER_SZ,
+                undef,
+                undef)
         associate_julia_struct(tcp.handle, tcp)
         finalizer(uvfinalize, tcp)
         return tcp
     end
+end
+
+function Base.iolock_begin(s::TCPSocket)
+    ccall(:jl_socklock_begin, Cvoid, (Ptr{Cvoid},), s.eventLoop)
+end
+
+function Base.iolock_end(s::TCPSocket)
+    ccall(:jl_socklock_end, Cvoid, (Ptr{Cvoid},), s.eventLoop)
+end
+
+function init_socklock(socklock::Ptr{Cvoid})
+    ccall(:jl_init_socklock, Cvoid, (Ptr{Cvoid},), socklock)
+end
+
+function sizeof_socklock()
+   return  ccall(:jl_sizeof_socklock, Int32, ())
 end
 
 # kw arg "delay": if true, libuv delays creation of the socket fd till the first bind call
@@ -90,12 +109,18 @@ function TCPSocket(; delay=true)
     af_spec = delay ? 0 : 2   # AF_UNSPEC is 0, AF_INET is 2
     eventLoop = Libc.malloc(sizeof_uvloop())
     uv_loop_init(eventLoop)
-    iolock_begin()
+    tcp.eventLoop = eventLoop
+
+    socklock = Libc.malloc(sizeof_socklock())
+    init_socklock(socklock)
+    tcp.socklock = socklock
+
+    iolock_begin(eventLoop, socklock)
     err = ccall(:uv_tcp_init_ex, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cuint),
                 eventLoop, tcp.handle, af_spec)
     uv_error("failed to create tcp socket", err)
     tcp.status = StatusInit
-    iolock_end()
+    iolock_end(eventLoop, socklock)
     return tcp
 end
 
@@ -951,7 +976,7 @@ function Base.close(stream::TCPSocket)
         ccall(:jl_forceclose_uv, Cvoid, (Ptr{Cvoid},), stream.handle)
         stream.status = StatusClosing
     elseif isopen(stream)
-        should_wait = uv_handle_data(stream) != C_NULL
+        should_wait = Base.uv_handle_data(stream) != C_NULL
         if stream.status != StatusClosing
             ccall(:jl_close_uv, Cvoid, (Ptr{Cvoid},), stream.handle)
             stream.status = StatusClosing
