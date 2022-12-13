@@ -434,6 +434,8 @@ function wait_readnb(x::LibuvStream, nb::Int)
     nothing
 end
 
+
+
 function closewrite(s::LibuvStream)
     iolock_begin()
     check_open(s)

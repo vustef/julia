@@ -2013,6 +2013,8 @@ typedef int jl_uv_os_fd_t;
 
 JL_DLLEXPORT int jl_process_events(void);
 
+JL_DLLEXPORT int jl_process_events2(struct uv_loop_s *loop);
+
 JL_DLLEXPORT struct uv_loop_s *jl_global_event_loop(void);
 
 JL_DLLEXPORT void jl_close_uv(struct uv_handle_s *handle);

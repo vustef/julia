@@ -31,8 +31,10 @@ export
     IPv4,
     IPv6
 
+import Base
 import Base: isless, show, print, parse, bind, convert, isreadable, iswritable, alloc_buf_hook, _uv_hook_close
 
+using Base
 using Base: LibuvStream, LibuvServer, PipeEndpoint, @handle_as, uv_error, associate_julia_struct, uvfinalize,
     notify_error, uv_req_data, uv_req_set_data, preserve_handle, unpreserve_handle, _UVError, IOError,
     eventloop, StatusUninit, StatusInit, StatusConnecting, StatusOpen, StatusClosing, StatusClosed, StatusActive,
@@ -64,6 +66,7 @@ mutable struct TCPSocket <: LibuvStream
     sendbuf::Union{IOBuffer, Nothing}
     lock::ReentrantLock # advisory lock
     throttle::Int
+    eventLoop::Ptr{Cvoid}
 
     function TCPSocket(handle::Ptr{Cvoid}, status)
         tcp = new(
@@ -85,9 +88,11 @@ end
 function TCPSocket(; delay=true)
     tcp = TCPSocket(Libc.malloc(Base._sizeof_uv_tcp), StatusUninit)
     af_spec = delay ? 0 : 2   # AF_UNSPEC is 0, AF_INET is 2
+    eventLoop = Libc.malloc(Base._sizeof_uv_loop)
+    uv_loop_init(eventLoop);
     iolock_begin()
     err = ccall(:uv_tcp_init_ex, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cuint),
-                eventloop(), tcp.handle, af_spec)
+                eventLoop, tcp.handle, af_spec)
     uv_error("failed to create tcp socket", err)
     tcp.status = StatusInit
     iolock_end()
@@ -494,7 +499,7 @@ function uv_connectcb(conn::Ptr{Cvoid}, status::Cint)
 end
 
 function connect!(sock::TCPSocket, host::Union{IPv4, IPv6}, port::Integer)
-    iolock_begin()
+    #iolock_begin()
     if sock.status != StatusInit
         error("TCPSocket is not in initialization state")
     end
@@ -506,24 +511,24 @@ function connect!(sock::TCPSocket, host::Union{IPv4, IPv6}, port::Integer)
                               sock, host_in, hton(UInt16(port)), @cfunction(uv_connectcb, Cvoid, (Ptr{Cvoid}, Cint)),
                               host isa IPv6))
     sock.status = StatusConnecting
-    iolock_end()
+    #iolock_end()
     nothing
 end
 
 connect!(sock::TCPSocket, addr::InetAddr) = connect!(sock, addr.host, addr.port)
 
 function wait_connected(x::LibuvStream)
-    iolock_begin()
+    #iolock_begin()
     check_open(x)
     isopen(x) || x.readerror === nothing || throw(x.readerror)
     preserve_handle(x)
     lock(x.cond)
     try
         while x.status == StatusConnecting
-            iolock_end()
+            #iolock_end()
             wait(x.cond)
             unlock(x.cond)
-            iolock_begin()
+            #iolock_begin()
             lock(x.cond)
         end
         isopen(x) || x.readerror === nothing || throw(x.readerror)
@@ -531,7 +536,7 @@ function wait_connected(x::LibuvStream)
         unlock(x.cond)
         unpreserve_handle(x)
     end
-    iolock_end()
+    #iolock_end()
     nothing
 end
 
@@ -575,11 +580,11 @@ Enables or disables Nagle's algorithm on a given TCP server or socket.
 """
 function nagle(sock::Union{TCPServer, TCPSocket}, enable::Bool)
     # disable or enable Nagle's algorithm on all OSes
-    iolock_begin()
+    #iolock_begin()
     check_open(sock)
     err = ccall(:uv_tcp_nodelay, Cint, (Ptr{Cvoid}, Cint), sock.handle, Cint(!enable))
     # TODO: check err
-    iolock_end()
+    #iolock_end()
     return err
 end
 
@@ -808,7 +813,7 @@ function _sockname(sock, self=true)
     raddress = zeros(UInt8, 16)
     rfamily = Ref{Cuint}(0)
 
-    iolock_begin()
+    #iolock_begin()
     if self
         r = ccall(:jl_tcp_getsockname, Int32,
                 (Ptr{Cvoid}, Ref{Cushort}, Ptr{Cvoid}, Ref{Cuint}),
@@ -818,7 +823,7 @@ function _sockname(sock, self=true)
                 (Ptr{Cvoid}, Ref{Cushort}, Ptr{Cvoid}, Ref{Cuint}),
                 sock.handle, rport, raddress, rfamily)
     end
-    iolock_end()
+    #iolock_end()
     uv_error("cannot obtain socket name", r)
     port = ntoh(rport[])
     af_inet6 = @static if Sys.iswindows() # AF_INET6 in <sys/socket.h>
@@ -844,6 +849,433 @@ function _sockname(sock, self=true)
         error(string("unsupported address family: ", rfamily[]))
     end
     return addr, port
+end
+
+# Overrides.
+
+function Base.wait_readnb(x::TCPSocket, nb::Int)
+    # fast path before iolock acquire
+    bytesavailable(x.buffer) >= nb && return
+    open = isopen(x) && x.status != StatusEOF # must precede readerror check
+    x.readerror === nothing || throw(x.readerror)
+    open || return
+    #iolock_begin()
+    # repeat fast path after iolock acquire, before other expensive work
+    bytesavailable(x.buffer) >= nb && (iolock_end(); return)
+    open = isopen(x) && x.status != StatusEOF
+    x.readerror === nothing || throw(x.readerror)
+    open || (iolock_end(); return)
+    # now do the "real" work
+    oldthrottle = x.throttle
+    preserve_handle(x)
+    lock(x.cond)
+    try
+        while bytesavailable(x.buffer) < nb
+            x.readerror === nothing || throw(x.readerror)
+            isopen(x) || break
+            x.status == StatusEOF && break
+            x.throttle = max(nb, x.throttle)
+            start_reading(x) # ensure we are reading
+            #iolock_end()
+            wait(x.cond)
+            unlock(x.cond)
+            #iolock_begin()
+            lock(x.cond)
+        end
+    finally
+        if isempty(x.cond)
+            stop_reading(x) # stop reading iff there are currently no other read clients of the stream
+        end
+        if oldthrottle <= x.throttle <= nb
+            # if we're interleaving readers, we might not get back to the "original" throttle
+            # but we consider that an acceptable "risk", since we can't be quite sure what the intended value is now
+            x.throttle = oldthrottle
+        end
+        unpreserve_handle(x)
+        unlock(x.cond)
+    end
+    #iolock_end()
+    nothing
+end
+
+function Base.closewrite(s::TCPSocket)
+    #iolock_begin()
+    check_open(s)
+    req = Libc.malloc(_sizeof_uv_shutdown)
+    uv_req_set_data(req, C_NULL) # in case we get interrupted before arriving at the wait call
+    err = ccall(:uv_shutdown, Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                req, s, @cfunction(Base.uv_shutdowncb_task, Cvoid, (Ptr{Cvoid}, Cint)))
+    if err < 0
+        Libc.free(req)
+        uv_error("shutdown", err)
+    end
+    ct = current_task()
+    preserve_handle(ct)
+    sigatomic_begin()
+    uv_req_set_data(req, ct)
+    #iolock_end()
+    status = try
+        sigatomic_end()
+        wait()::Cint
+    finally
+        # try-finally unwinds the sigatomic level, so need to repeat sigatomic_end
+        sigatomic_end()
+        #iolock_begin()
+        ct.queue === nothing || list_deletefirst!(ct.queue, ct)
+        if uv_req_data(req) != C_NULL
+            # req is still alive,
+            # so make sure we won't get spurious notifications later
+            uv_req_set_data(req, C_NULL)
+        else
+            # done with req
+            Libc.free(req)
+        end
+        #iolock_end()
+        unpreserve_handle(ct)
+    end
+    if isopen(s)
+        if status < 0 || ccall(:uv_is_readable, Cint, (Ptr{Cvoid},), s.handle) == 0
+            close(s)
+        end
+    end
+    if status < 0
+        throw(_UVError("shutdown", status))
+    end
+    nothing
+end
+
+function Base.close(stream::TCPSocket)
+    #iolock_begin()
+    should_wait = false
+    if stream.status == StatusInit
+        ccall(:jl_forceclose_uv, Cvoid, (Ptr{Cvoid},), stream.handle)
+        stream.status = StatusClosing
+    elseif isopen(stream)
+        should_wait = uv_handle_data(stream) != C_NULL
+        if stream.status != StatusClosing
+            ccall(:jl_close_uv, Cvoid, (Ptr{Cvoid},), stream.handle)
+            stream.status = StatusClosing
+        end
+    end
+    #iolock_end()
+    should_wait && wait_close(stream)
+    nothing
+end
+
+
+function Base.uvfinalize(uv::TCPSocket)
+    uv.handle == C_NULL && return
+    #iolock_begin()
+    if uv.handle != C_NULL
+        disassociate_julia_struct(uv.handle) # not going to call the usual close hooks
+        if uv.status != StatusUninit
+            close(uv)
+        else
+            Libc.free(uv.handle)
+        end
+        uv.status = StatusClosed
+        uv.handle = C_NULL
+    end
+    #iolock_end()
+    nothing
+end
+
+function Base.start_reading(stream::TCPSocket)
+    #iolock_begin()
+    if stream.status == StatusOpen
+        if !isreadable(stream)
+            error("tried to read a stream that is not readable")
+        end
+        # libuv may call the alloc callback immediately
+        # for a TTY on Windows, so ensure the status is set first
+        stream.status = StatusActive
+        ret = ccall(:uv_read_start, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                    stream, @cfunction(Base.uv_alloc_buf, Cvoid, (Ptr{Cvoid}, Csize_t, Ptr{Cvoid})),
+                    @cfunction(Base.uv_readcb, Cvoid, (Ptr{Cvoid}, Cssize_t, Ptr{Cvoid})))
+    elseif stream.status == StatusPaused
+        stream.status = StatusActive
+        ret = Int32(0)
+    elseif stream.status == StatusActive
+        ret = Int32(0)
+    else
+        ret = Int32(-1)
+    end
+    #iolock_end()
+    return ret
+end
+
+
+if Sys.iswindows()
+    function Base.stop_reading(stream::TCPSocket)
+        #iolock_begin()
+        if stream.status == StatusActive
+            stream.status = StatusOpen
+            ccall(:uv_read_stop, Cint, (Ptr{Cvoid},), stream)
+        end
+        #iolock_end()
+        nothing
+    end
+else
+    function Base.stop_reading(stream::TCPSocket)
+        #iolock_begin()
+        if stream.status == StatusActive
+            stream.status = StatusPaused
+        end
+        #iolock_end()
+        nothing
+    end
+end
+
+
+function Base.readbytes!(s::TCPSocket, a::Vector{UInt8}, nb::Int)
+    #iolock_begin()
+    sbuf = s.buffer
+    @assert sbuf.seekable == false
+    @assert sbuf.maxsize >= nb
+
+    function wait_locked(s, buf, nb)
+        while bytesavailable(buf) < nb
+            s.readerror === nothing || throw(s.readerror)
+            isopen(s) || break
+            s.status != StatusEOF || break
+            #iolock_end()
+            wait_readnb(s, nb)
+            #iolock_begin()
+        end
+    end
+
+    if nb <= SZ_UNBUFFERED_IO # Under this limit we are OK with copying the array from the stream's buffer
+        wait_locked(s, sbuf, nb)
+    end
+    if bytesavailable(sbuf) >= nb
+        nread = readbytes!(sbuf, a, nb)
+    else
+        newbuf = PipeBuffer(a, maxsize=nb)
+        newbuf.size = 0 # reset the write pointer to the beginning
+        nread = try
+            s.buffer = newbuf
+            write(newbuf, sbuf)
+            wait_locked(s, newbuf, nb)
+            bytesavailable(newbuf)
+        finally
+            s.buffer = sbuf
+        end
+        compact(newbuf)
+    end
+    #iolock_end()
+    return nread
+end
+
+function Base.read(stream::TCPSocket)
+    wait_readnb(stream, typemax(Int))
+    #iolock_begin()
+    bytes = take!(stream.buffer)
+    #iolock_end()
+    return bytes
+end
+
+
+function Base.unsafe_read(s::TCPSocket, p::Ptr{UInt8}, nb::UInt)
+    #iolock_begin()
+    sbuf = s.buffer
+    @assert sbuf.seekable == false
+    @assert sbuf.maxsize >= nb
+
+    function wait_locked(s, buf, nb)
+        while bytesavailable(buf) < nb
+            s.readerror === nothing || throw(s.readerror)
+            isopen(s) || throw(EOFError())
+            s.status != StatusEOF || throw(EOFError())
+            #iolock_end()
+            wait_readnb(s, nb)
+            #iolock_begin()
+        end
+    end
+
+    if nb <= SZ_UNBUFFERED_IO # Under this limit we are OK with copying the array from the stream's buffer
+        wait_locked(s, sbuf, Int(nb))
+    end
+    if bytesavailable(sbuf) >= nb
+        unsafe_read(sbuf, p, nb)
+    else
+        newbuf = PipeBuffer(unsafe_wrap(Array, p, nb), maxsize=Int(nb))
+        newbuf.size = 0 # reset the write pointer to the beginning
+        try
+            s.buffer = newbuf
+            write(newbuf, sbuf)
+            wait_locked(s, newbuf, Int(nb))
+        finally
+            s.buffer = sbuf
+        end
+    end
+    #iolock_end()
+    nothing
+end
+
+
+function Base.read(this::TCPSocket, ::Type{UInt8})
+    #iolock_begin()
+    sbuf = this.buffer
+    @assert sbuf.seekable == false
+    while bytesavailable(sbuf) < 1
+        #iolock_end()
+        eof(this) && throw(EOFError())
+        #iolock_begin()
+    end
+    c = read(sbuf, UInt8)
+    #iolock_end()
+    return c
+end
+
+function Base.readavailable(this::TCPSocket)
+    wait_readnb(this, 1) # unlike the other `read` family of functions, this one doesn't guarantee error reporting
+    #iolock_begin()
+    buf = this.buffer
+    @assert buf.seekable == false
+    bytes = take!(buf)
+    #iolock_end()
+    return bytes
+end
+
+function Base.readuntil(x::TCPSocket, c::UInt8; keep::Bool=false)
+    #iolock_begin()
+    buf = x.buffer
+    @assert buf.seekable == false
+    if !occursin(c, buf) # fast path checks first
+        x.readerror === nothing || throw(x.readerror)
+        if isopen(x) && x.status != StatusEOF
+            preserve_handle(x)
+            lock(x.cond)
+            try
+                while !occursin(c, x.buffer)
+                    x.readerror === nothing || throw(x.readerror)
+                    isopen(x) || break
+                    x.status != StatusEOF || break
+                    start_reading(x) # ensure we are reading
+                    #iolock_end()
+                    wait(x.cond)
+                    unlock(x.cond)
+                    #iolock_begin()
+                    lock(x.cond)
+                end
+            finally
+                if isempty(x.cond)
+                    stop_reading(x) # stop reading iff there are currently no other read clients of the stream
+                end
+                unlock(x.cond)
+                unpreserve_handle(x)
+            end
+        end
+    end
+    bytes = readuntil(buf, c, keep=keep)
+    #iolock_end()
+    return bytes
+end
+
+function Base.uv_write(s::TCPSocket, p::Ptr{UInt8}, n::UInt)
+    uvw = uv_write_async(s, p, n)
+    ct = current_task()
+    preserve_handle(ct)
+    sigatomic_begin()
+    uv_req_set_data(uvw, ct)
+    #iolock_end()
+    status = try
+        sigatomic_end()
+        # wait for the last chunk to complete (or error)
+        # assume that any errors would be sticky,
+        # (so we don't need to monitor the error status of the intermediate writes)
+        wait()::Cint
+    finally
+        # try-finally unwinds the sigatomic level, so need to repeat sigatomic_end
+        sigatomic_end()
+        #iolock_begin()
+        ct.queue === nothing || list_deletefirst!(ct.queue, ct)
+        if uv_req_data(uvw) != C_NULL
+            # uvw is still alive,
+            # so make sure we won't get spurious notifications later
+            uv_req_set_data(uvw, C_NULL)
+        else
+            # done with uvw
+            Libc.free(uvw)
+        end
+        #iolock_end()
+        unpreserve_handle(ct)
+    end
+    if status < 0
+        throw(_UVError("write", status))
+    end
+    return Int(n)
+end
+
+function Base.unsafe_write(s::TCPSocket, p::Ptr{UInt8}, n::UInt)
+    while true
+        # try to add to the send buffer
+        #iolock_begin()
+        buf = s.sendbuf
+        buf === nothing && break
+        totb = bytesavailable(buf) + n
+        if totb < buf.maxsize
+            nb = unsafe_write(buf, p, n)
+            #iolock_end()
+            return nb
+        end
+        bytesavailable(buf) == 0 && break
+        # perform flush(s)
+        arr = take!(buf)
+        uv_write(s, arr)
+    end
+    # perform the output to the kernel
+    return uv_write(s, p, n)
+end
+
+function Base.flush(s::TCPSocket)
+    #iolock_begin()
+    buf = s.sendbuf
+    if buf !== nothing
+        if bytesavailable(buf) > 0
+            arr = take!(buf)
+            uv_write(s, arr)
+            return
+        end
+    end
+    uv_write(s, Ptr{UInt8}(Base.eventloop()), UInt(0)) # zero write from a random pointer to flush current queue
+    return
+end
+
+function Base.buffer_writes(s::TCPSocket, bufsize)
+    sendbuf = PipeBuffer(bufsize)
+    #iolock_begin()
+    s.sendbuf = sendbuf
+    #iolock_end()
+    return s
+end
+
+function Base.write(s::TCPSocket, b::UInt8)
+    buf = s.sendbuf
+    if buf !== nothing
+        #iolock_begin()
+        if bytesavailable(buf) + 1 < buf.maxsize
+            n = write(buf, b)
+            #iolock_end()
+            return n
+        end
+        #iolock_end()
+    end
+    return write(s, Ref{UInt8}(b))
+end
+
+function Base.wait(s::TCPSocket)
+    GC.safepoint()
+    W = Workqueues[Threads.threadid()]
+    poptask(W)
+    result = try_yieldto(ensure_rescheduled)
+    process_events(s)
+    # return when we come out of the queue
+    return result
+end
+
+function process_events(s::TCPSocket)
+    return ccall(:jl_process_events2, Int32, (Ptr{Cvoid},), s.eventLoop)
 end
 
 # domain sockets

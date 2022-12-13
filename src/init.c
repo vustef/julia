@@ -196,7 +196,7 @@ static void jl_close_item_atexit(uv_handle_t *handle)
     }
 }
 
-JL_DLLEXPORT void jl_atexit_hook(int exitcode)
+JL_DLLEXPORT void jl_atexit_hook(int exitcode) // TODO @vustef: Should uv_run on all TCPSockets loops here.
 {
     if (jl_all_tls_states == NULL)
         return;
@@ -235,7 +235,7 @@ JL_DLLEXPORT void jl_atexit_hook(int exitcode)
 
     jl_gc_run_all_finalizers(ct);
 
-    uv_loop_t *loop = jl_global_event_loop();
+    uv_loop_t *loop = jl_global_event_loop(); // TODO @vustef: Close all event loops?
 
     if (loop == NULL) {
         return;

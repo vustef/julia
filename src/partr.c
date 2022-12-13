@@ -477,7 +477,7 @@ static int may_sleep(jl_ptls_t ptls) JL_NOTSAFEPOINT
 
 extern _Atomic(unsigned) _threadedregion;
 
-JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *trypoptask, jl_value_t *q)
+JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *trypoptask, jl_value_t *q) // TODO @vustef: This will get called from wait()->poptask(), which we already implemented for TCPSocket, so perhaps no need to create fork of this that `uv_run`s for the TCPSocket?
 {
     jl_task_t *ct = jl_current_task;
     uint64_t start_cycles = 0;

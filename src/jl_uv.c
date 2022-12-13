@@ -46,7 +46,7 @@ void jl_wake_libuv(void)
 
 jl_mutex_t jl_uv_mutex;
 
-void jl_init_uv(void)
+void jl_init_uv(void) // TODO @vustef: Do the locking per TCPSocket, and add these callbacks
 {
     uv_async_init(jl_io_loop, &signal_async, jl_signal_async_cb);
     JL_MUTEX_INIT(&jl_uv_mutex); // a file-scope initializer can be used instead
@@ -203,6 +203,24 @@ JL_DLLEXPORT int jl_process_events(void)
 {
     jl_task_t *ct = jl_current_task;
     uv_loop_t *loop = jl_io_loop;
+    jl_gc_safepoint_(ct->ptls);
+    if (loop && (jl_atomic_load_relaxed(&_threadedregion) || jl_atomic_load_relaxed(&ct->tid) == 0)) {
+        if (jl_atomic_load_relaxed(&jl_uv_n_waiters) == 0 && jl_mutex_trylock(&jl_uv_mutex)) {
+            JL_PROBE_RT_START_PROCESS_EVENTS(ct);
+            loop->stop_flag = 0;
+            int r = uv_run(loop, UV_RUN_NOWAIT);
+            JL_PROBE_RT_FINISH_PROCESS_EVENTS(ct);
+            JL_UV_UNLOCK();
+            return r;
+        }
+        jl_gc_safepoint_(ct->ptls);
+    }
+    return 0;
+}
+
+JL_DLLEXPORT int jl_process_events2(uv_loop_t *loop)
+{
+    jl_task_t *ct = jl_current_task;
     jl_gc_safepoint_(ct->ptls);
     if (loop && (jl_atomic_load_relaxed(&_threadedregion) || jl_atomic_load_relaxed(&ct->tid) == 0)) {
         if (jl_atomic_load_relaxed(&jl_uv_n_waiters) == 0 && jl_mutex_trylock(&jl_uv_mutex)) {
