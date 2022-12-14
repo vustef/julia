@@ -126,11 +126,11 @@ end
 
 function TCPSocket(fd::OS_HANDLE)
     tcp = TCPSocket()
-    iolock_begin()
+    iolock_begin(tcp)
     err = ccall(:uv_tcp_open, Int32, (Ptr{Cvoid}, OS_HANDLE), tcp.handle, fd)
     uv_error("tcp_open", err)
     tcp.status = StatusOpen
-    iolock_end()
+    iolock_end(tcp)
     return tcp
 end
 if OS_HANDLE != RawFD
@@ -282,7 +282,7 @@ Bind `socket` to the given `host:port`. Note that `0.0.0.0` will listen on all d
 * If `reuseaddr=true`, multiple threads or processes can bind to the same address without error
   if they all set `reuseaddr=true`, but only the last to bind will receive any traffic.
 """
-function bind(sock::Union{TCPServer, UDPSocket, TCPSocket}, host::IPAddr, port::Integer; ipv6only = false, reuseaddr = false, kws...)
+function bind(sock::Union{TCPServer, UDPSocket}, host::IPAddr, port::Integer; ipv6only = false, reuseaddr = false, kws...)
     if sock.status != StatusInit
         error("$(typeof(sock)) is not in initialization state")
     end
@@ -309,6 +309,36 @@ function bind(sock::Union{TCPServer, UDPSocket, TCPSocket}, host::IPAddr, port::
     end
     isa(sock, UDPSocket) && setopt(sock; kws...)
     iolock_end()
+    return true
+end
+
+function bind(sock::TCPSocket, host::IPAddr, port::Integer; ipv6only = false, reuseaddr = false, kws...)
+    if sock.status != StatusInit
+        error("$(typeof(sock)) is not in initialization state")
+    end
+    flags = 0
+    if isa(host, IPv6) && ipv6only
+        flags |= isa(sock, UDPSocket) ? UV_UDP_IPV6ONLY : UV_TCP_IPV6ONLY
+    end
+    if isa(sock, UDPSocket) && reuseaddr
+        flags |= UV_UDP_REUSEADDR
+    end
+    iolock_begin(sock)
+    err = _bind(sock, host, UInt16(port), UInt32(flags))
+    if err < 0
+        iolock_end(sock)
+        if err != UV_EADDRINUSE && err != UV_EACCES && err != UV_EADDRNOTAVAIL
+            #TODO: this codepath is not currently tested
+            throw(_UVError("bind", err))
+        else
+            return false
+        end
+    end
+    if isa(sock, TCPServer) || isa(sock, UDPSocket)
+        sock.status = StatusOpen
+    end
+    isa(sock, UDPSocket) && setopt(sock; kws...)
+    iolock_end(sock)
     return true
 end
 
@@ -524,7 +554,7 @@ function uv_connectcb(conn::Ptr{Cvoid}, status::Cint)
 end
 
 function connect!(sock::TCPSocket, host::Union{IPv4, IPv6}, port::Integer)
-    iolock_begin(tcp)
+    iolock_begin(sock)
     if sock.status != StatusInit
         error("TCPSocket is not in initialization state")
     end
@@ -536,21 +566,21 @@ function connect!(sock::TCPSocket, host::Union{IPv4, IPv6}, port::Integer)
                               sock, host_in, hton(UInt16(port)), @cfunction(uv_connectcb, Cvoid, (Ptr{Cvoid}, Cint)),
                               host isa IPv6))
     sock.status = StatusConnecting
-    iolock_end(tcp)
+    iolock_end(sock)
     nothing
 end
 
 connect!(sock::TCPSocket, addr::InetAddr) = connect!(sock, addr.host, addr.port)
 
 function wait_connected(x::LibuvStream)
-    iolock_begin(tcp)
+    iolock_begin()
     check_open(x)
     isopen(x) || x.readerror === nothing || throw(x.readerror)
     preserve_handle(x)
     lock(x.cond)
     try
         while x.status == StatusConnecting
-            iolock_end(tcp)
+            iolock_end()
             wait(x.cond)
             unlock(x.cond)
             iolock_begin(tcp)
@@ -561,7 +591,30 @@ function wait_connected(x::LibuvStream)
         unlock(x.cond)
         unpreserve_handle(x)
     end
-    iolock_end(tcp)
+    iolock_end()
+    nothing
+end
+
+function wait_connected(x::TCPSocket)
+    iolock_begin(x)
+    check_open(x)
+    isopen(x) || x.readerror === nothing || throw(x.readerror)
+    preserve_handle(x)
+    lock(x.cond)
+    try
+        while x.status == StatusConnecting
+            iolock_end(x)
+            wait(x.cond)
+            unlock(x.cond)
+            iolock_begin(tcp)
+            lock(x.cond)
+        end
+        isopen(x) || x.readerror === nothing || throw(x.readerror)
+    finally
+        unlock(x.cond)
+        unpreserve_handle(x)
+    end
+    iolock_end(x)
     nothing
 end
 
@@ -605,11 +658,11 @@ Enables or disables Nagle's algorithm on a given TCP server or socket.
 """
 function nagle(sock::Union{TCPServer, TCPSocket}, enable::Bool)
     # disable or enable Nagle's algorithm on all OSes
-    iolock_begin(tcp)
+    iolock_begin(sock)
     check_open(sock)
     err = ccall(:uv_tcp_nodelay, Cint, (Ptr{Cvoid}, Cint), sock.handle, Cint(!enable))
     # TODO: check err
-    iolock_end(tcp)
+    iolock_end(sock)
     return err
 end
 
@@ -618,7 +671,20 @@ end
 
 On Linux systems, the TCP_QUICKACK is disabled or enabled on `socket`.
 """
-function quickack(sock::Union{TCPServer, TCPSocket}, enable::Bool)
+function quickack(sock::TCPSocket, enable::Bool)
+    iolock_begin(sock)
+    check_open(sock)
+    @static if Sys.islinux()
+        # tcp_quickack is a linux only option
+        if ccall(:jl_tcp_quickack, Cint, (Ptr{Cvoid}, Cint), sock.handle, Cint(enable)) < 0
+            @warn "Networking unoptimized ( Error enabling TCP_QUICKACK : $(Libc.strerror(Libc.errno())) )" maxlog=1
+        end
+    end
+    iolock_end(sock)
+    nothing
+end
+
+function quickack(sock::TCPServer, enable::Bool)
     iolock_begin()
     check_open(sock)
     @static if Sys.islinux()
@@ -838,7 +904,7 @@ function _sockname(sock, self=true)
     raddress = zeros(UInt8, 16)
     rfamily = Ref{Cuint}(0)
 
-    iolock_begin(tcp)
+    iolock_begin(sock)
     if self
         r = ccall(:jl_tcp_getsockname, Int32,
                 (Ptr{Cvoid}, Ref{Cushort}, Ptr{Cvoid}, Ref{Cuint}),
@@ -848,7 +914,7 @@ function _sockname(sock, self=true)
                 (Ptr{Cvoid}, Ref{Cushort}, Ptr{Cvoid}, Ref{Cuint}),
                 sock.handle, rport, raddress, rfamily)
     end
-    iolock_end(tcp)
+    iolock_end(sock)
     uv_error("cannot obtain socket name", r)
     port = ntoh(rport[])
     af_inet6 = @static if Sys.iswindows() # AF_INET6 in <sys/socket.h>
@@ -884,12 +950,12 @@ function Base.wait_readnb(x::TCPSocket, nb::Int)
     open = isopen(x) && x.status != StatusEOF # must precede readerror check
     x.readerror === nothing || throw(x.readerror)
     open || return
-    iolock_begin(tcp)
+    iolock_begin(x)
     # repeat fast path after iolock acquire, before other expensive work
-    bytesavailable(x.buffer) >= nb && (iolock_end(); return)
+    bytesavailable(x.buffer) >= nb && (iolock_end(x); return)
     open = isopen(x) && x.status != StatusEOF
     x.readerror === nothing || throw(x.readerror)
-    open || (iolock_end(); return)
+    open || (iolock_end(x); return)
     # now do the "real" work
     oldthrottle = x.throttle
     preserve_handle(x)
@@ -919,7 +985,7 @@ function Base.wait_readnb(x::TCPSocket, nb::Int)
         unpreserve_handle(x)
         unlock(x.cond)
     end
-    iolock_end(tcp)
+    iolock_end(x)
     nothing
 end
 
