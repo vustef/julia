@@ -89,8 +89,7 @@ static void jl_signal_async_cb_sock(uv_async_t *hdl)
 {
     // This should abort the current loop and the julia code it returns to
     // or the safepoint in the callers of `uv_run` should throw the exception.
-    (void)hdl;
-    uv_stop(jl_io_loop); // TODO @vustef: need to access correct loop here...
+    uv_stop(hdl->loop);
 }
 
 void jl_init_uv_sock(uv_loop_t* loop, socklock* sl)

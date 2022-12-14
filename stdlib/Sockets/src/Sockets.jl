@@ -115,12 +115,12 @@ function TCPSocket(; delay=true)
     init_socklock(eventLoop, socklock)
     tcp.socklock = socklock
 
-    iolock_begin(eventLoop, socklock) # TODO @vustef: Replace commented locks with these.
+    iolock_begin(tcp)
     err = ccall(:uv_tcp_init_ex, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cuint),
                 eventLoop, tcp.handle, af_spec)
     uv_error("failed to create tcp socket", err)
     tcp.status = StatusInit
-    iolock_end(eventLoop, socklock)
+    iolock_end(tcp)
     return tcp
 end
 
@@ -524,7 +524,7 @@ function uv_connectcb(conn::Ptr{Cvoid}, status::Cint)
 end
 
 function connect!(sock::TCPSocket, host::Union{IPv4, IPv6}, port::Integer)
-    #iolock_begin()
+    iolock_begin(tcp)
     if sock.status != StatusInit
         error("TCPSocket is not in initialization state")
     end
@@ -536,24 +536,24 @@ function connect!(sock::TCPSocket, host::Union{IPv4, IPv6}, port::Integer)
                               sock, host_in, hton(UInt16(port)), @cfunction(uv_connectcb, Cvoid, (Ptr{Cvoid}, Cint)),
                               host isa IPv6))
     sock.status = StatusConnecting
-    #iolock_end()
+    iolock_end(tcp)
     nothing
 end
 
 connect!(sock::TCPSocket, addr::InetAddr) = connect!(sock, addr.host, addr.port)
 
 function wait_connected(x::LibuvStream)
-    #iolock_begin()
+    iolock_begin(tcp)
     check_open(x)
     isopen(x) || x.readerror === nothing || throw(x.readerror)
     preserve_handle(x)
     lock(x.cond)
     try
         while x.status == StatusConnecting
-            #iolock_end()
+            iolock_end(tcp)
             wait(x.cond)
             unlock(x.cond)
-            #iolock_begin()
+            iolock_begin(tcp)
             lock(x.cond)
         end
         isopen(x) || x.readerror === nothing || throw(x.readerror)
@@ -561,7 +561,7 @@ function wait_connected(x::LibuvStream)
         unlock(x.cond)
         unpreserve_handle(x)
     end
-    #iolock_end()
+    iolock_end(tcp)
     nothing
 end
 
@@ -605,11 +605,11 @@ Enables or disables Nagle's algorithm on a given TCP server or socket.
 """
 function nagle(sock::Union{TCPServer, TCPSocket}, enable::Bool)
     # disable or enable Nagle's algorithm on all OSes
-    #iolock_begin()
+    iolock_begin(tcp)
     check_open(sock)
     err = ccall(:uv_tcp_nodelay, Cint, (Ptr{Cvoid}, Cint), sock.handle, Cint(!enable))
     # TODO: check err
-    #iolock_end()
+    iolock_end(tcp)
     return err
 end
 
@@ -838,7 +838,7 @@ function _sockname(sock, self=true)
     raddress = zeros(UInt8, 16)
     rfamily = Ref{Cuint}(0)
 
-    #iolock_begin()
+    iolock_begin(tcp)
     if self
         r = ccall(:jl_tcp_getsockname, Int32,
                 (Ptr{Cvoid}, Ref{Cushort}, Ptr{Cvoid}, Ref{Cuint}),
@@ -848,7 +848,7 @@ function _sockname(sock, self=true)
                 (Ptr{Cvoid}, Ref{Cushort}, Ptr{Cvoid}, Ref{Cuint}),
                 sock.handle, rport, raddress, rfamily)
     end
-    #iolock_end()
+    iolock_end(tcp)
     uv_error("cannot obtain socket name", r)
     port = ntoh(rport[])
     af_inet6 = @static if Sys.iswindows() # AF_INET6 in <sys/socket.h>
@@ -884,7 +884,7 @@ function Base.wait_readnb(x::TCPSocket, nb::Int)
     open = isopen(x) && x.status != StatusEOF # must precede readerror check
     x.readerror === nothing || throw(x.readerror)
     open || return
-    #iolock_begin()
+    iolock_begin(tcp)
     # repeat fast path after iolock acquire, before other expensive work
     bytesavailable(x.buffer) >= nb && (iolock_end(); return)
     open = isopen(x) && x.status != StatusEOF
@@ -901,10 +901,10 @@ function Base.wait_readnb(x::TCPSocket, nb::Int)
             x.status == StatusEOF && break
             x.throttle = max(nb, x.throttle)
             start_reading(x) # ensure we are reading
-            #iolock_end()
+            iolock_end(tcp)
             wait(x.cond)
             unlock(x.cond)
-            #iolock_begin()
+            iolock_begin(tcp)
             lock(x.cond)
         end
     finally
@@ -919,12 +919,12 @@ function Base.wait_readnb(x::TCPSocket, nb::Int)
         unpreserve_handle(x)
         unlock(x.cond)
     end
-    #iolock_end()
+    iolock_end(tcp)
     nothing
 end
 
 function Base.closewrite(s::TCPSocket)
-    #iolock_begin()
+    iolock_begin(tcp)
     check_open(s)
     req = Libc.malloc(_sizeof_uv_shutdown)
     uv_req_set_data(req, C_NULL) # in case we get interrupted before arriving at the wait call
@@ -938,14 +938,14 @@ function Base.closewrite(s::TCPSocket)
     preserve_handle(ct)
     sigatomic_begin()
     uv_req_set_data(req, ct)
-    #iolock_end()
+    iolock_end(tcp)
     status = try
         sigatomic_end()
         wait()::Cint
     finally
         # try-finally unwinds the sigatomic level, so need to repeat sigatomic_end
         sigatomic_end()
-        #iolock_begin()
+        iolock_begin(tcp)
         ct.queue === nothing || list_deletefirst!(ct.queue, ct)
         if uv_req_data(req) != C_NULL
             # req is still alive,
@@ -955,7 +955,7 @@ function Base.closewrite(s::TCPSocket)
             # done with req
             Libc.free(req)
         end
-        #iolock_end()
+        iolock_end(tcp)
         unpreserve_handle(ct)
     end
     if isopen(s)
@@ -970,7 +970,7 @@ function Base.closewrite(s::TCPSocket)
 end
 
 function Base.close(stream::TCPSocket)
-    #iolock_begin()
+    iolock_begin(tcp)
     should_wait = false
     if stream.status == StatusInit
         ccall(:jl_forceclose_uv, Cvoid, (Ptr{Cvoid},), stream.handle)
@@ -982,7 +982,7 @@ function Base.close(stream::TCPSocket)
             stream.status = StatusClosing
         end
     end
-    #iolock_end()
+    iolock_end(tcp)
     should_wait && wait_close(stream)
     nothing
 end
@@ -990,7 +990,7 @@ end
 
 function Base.uvfinalize(uv::TCPSocket)
     uv.handle == C_NULL && return
-    #iolock_begin()
+    iolock_begin(tcp)
     if uv.handle != C_NULL
         Base.disassociate_julia_struct(uv.handle) # not going to call the usual close hooks
         if uv.status != StatusUninit
@@ -1001,12 +1001,12 @@ function Base.uvfinalize(uv::TCPSocket)
         uv.status = StatusClosed
         uv.handle = C_NULL
     end
-    #iolock_end()
+    iolock_end(tcp)
     nothing
 end
 
 function Base.start_reading(stream::TCPSocket)
-    #iolock_begin()
+    iolock_begin(tcp)
     if stream.status == StatusOpen
         if !isreadable(stream)
             error("tried to read a stream that is not readable")
@@ -1025,35 +1025,35 @@ function Base.start_reading(stream::TCPSocket)
     else
         ret = Int32(-1)
     end
-    #iolock_end()
+    iolock_end(tcp)
     return ret
 end
 
 
 if Sys.iswindows()
     function Base.stop_reading(stream::TCPSocket)
-        #iolock_begin()
+        iolock_begin(tcp)
         if stream.status == StatusActive
             stream.status = StatusOpen
             ccall(:uv_read_stop, Cint, (Ptr{Cvoid},), stream)
         end
-        #iolock_end()
+        iolock_end(tcp)
         nothing
     end
 else
     function Base.stop_reading(stream::TCPSocket)
-        #iolock_begin()
+        iolock_begin(tcp)
         if stream.status == StatusActive
             stream.status = StatusPaused
         end
-        #iolock_end()
+        iolock_end(tcp)
         nothing
     end
 end
 
 
 function Base.readbytes!(s::TCPSocket, a::Vector{UInt8}, nb::Int)
-    #iolock_begin()
+    iolock_begin(tcp)
     sbuf = s.buffer
     @assert sbuf.seekable == false
     @assert sbuf.maxsize >= nb
@@ -1063,9 +1063,9 @@ function Base.readbytes!(s::TCPSocket, a::Vector{UInt8}, nb::Int)
             s.readerror === nothing || throw(s.readerror)
             isopen(s) || break
             s.status != StatusEOF || break
-            #iolock_end()
+            iolock_end(tcp)
             wait_readnb(s, nb)
-            #iolock_begin()
+            iolock_begin(tcp)
         end
     end
 
@@ -1087,21 +1087,21 @@ function Base.readbytes!(s::TCPSocket, a::Vector{UInt8}, nb::Int)
         end
         compact(newbuf)
     end
-    #iolock_end()
+    iolock_end(tcp)
     return nread
 end
 
 function Base.read(stream::TCPSocket)
     wait_readnb(stream, typemax(Int))
-    #iolock_begin()
+    iolock_begin(tcp)
     bytes = take!(stream.buffer)
-    #iolock_end()
+    iolock_end(tcp)
     return bytes
 end
 
 
 function Base.unsafe_read(s::TCPSocket, p::Ptr{UInt8}, nb::UInt)
-    #iolock_begin()
+    iolock_begin(tcp)
     sbuf = s.buffer
     @assert sbuf.seekable == false
     @assert sbuf.maxsize >= nb
@@ -1111,9 +1111,9 @@ function Base.unsafe_read(s::TCPSocket, p::Ptr{UInt8}, nb::UInt)
             s.readerror === nothing || throw(s.readerror)
             isopen(s) || throw(EOFError())
             s.status != StatusEOF || throw(EOFError())
-            #iolock_end()
+            iolock_end(tcp)
             wait_readnb(s, nb)
-            #iolock_begin()
+            iolock_begin(tcp)
         end
     end
 
@@ -1133,37 +1133,37 @@ function Base.unsafe_read(s::TCPSocket, p::Ptr{UInt8}, nb::UInt)
             s.buffer = sbuf
         end
     end
-    #iolock_end()
+    iolock_end(tcp)
     nothing
 end
 
 
 function Base.read(this::TCPSocket, ::Type{UInt8})
-    #iolock_begin()
+    iolock_begin(tcp)
     sbuf = this.buffer
     @assert sbuf.seekable == false
     while bytesavailable(sbuf) < 1
-        #iolock_end()
+        iolock_end(tcp)
         eof(this) && throw(EOFError())
-        #iolock_begin()
+        iolock_begin(tcp)
     end
     c = read(sbuf, UInt8)
-    #iolock_end()
+    iolock_end(tcp)
     return c
 end
 
 function Base.readavailable(this::TCPSocket)
     wait_readnb(this, 1) # unlike the other `read` family of functions, this one doesn't guarantee error reporting
-    #iolock_begin()
+    iolock_begin(tcp)
     buf = this.buffer
     @assert buf.seekable == false
     bytes = take!(buf)
-    #iolock_end()
+    iolock_end(tcp)
     return bytes
 end
 
 function Base.readuntil(x::TCPSocket, c::UInt8; keep::Bool=false)
-    #iolock_begin()
+    iolock_begin(tcp)
     buf = x.buffer
     @assert buf.seekable == false
     if !occursin(c, buf) # fast path checks first
@@ -1177,10 +1177,10 @@ function Base.readuntil(x::TCPSocket, c::UInt8; keep::Bool=false)
                     isopen(x) || break
                     x.status != StatusEOF || break
                     start_reading(x) # ensure we are reading
-                    #iolock_end()
+                    iolock_end(tcp)
                     wait(x.cond)
                     unlock(x.cond)
-                    #iolock_begin()
+                    iolock_begin(tcp)
                     lock(x.cond)
                 end
             finally
@@ -1193,7 +1193,7 @@ function Base.readuntil(x::TCPSocket, c::UInt8; keep::Bool=false)
         end
     end
     bytes = readuntil(buf, c, keep=keep)
-    #iolock_end()
+    iolock_end(tcp)
     return bytes
 end
 
@@ -1203,7 +1203,7 @@ function Base.uv_write(s::TCPSocket, p::Ptr{UInt8}, n::UInt)
     preserve_handle(ct)
     sigatomic_begin()
     uv_req_set_data(uvw, ct)
-    #iolock_end()
+    iolock_end(tcp)
     status = try
         sigatomic_end()
         # wait for the last chunk to complete (or error)
@@ -1213,7 +1213,7 @@ function Base.uv_write(s::TCPSocket, p::Ptr{UInt8}, n::UInt)
     finally
         # try-finally unwinds the sigatomic level, so need to repeat sigatomic_end
         sigatomic_end()
-        #iolock_begin()
+        iolock_begin(tcp)
         ct.queue === nothing || list_deletefirst!(ct.queue, ct)
         if uv_req_data(uvw) != C_NULL
             # uvw is still alive,
@@ -1223,7 +1223,7 @@ function Base.uv_write(s::TCPSocket, p::Ptr{UInt8}, n::UInt)
             # done with uvw
             Libc.free(uvw)
         end
-        #iolock_end()
+        iolock_end(tcp)
         unpreserve_handle(ct)
     end
     if status < 0
@@ -1235,13 +1235,13 @@ end
 function Base.unsafe_write(s::TCPSocket, p::Ptr{UInt8}, n::UInt)
     while true
         # try to add to the send buffer
-        #iolock_begin()
+        iolock_begin(tcp)
         buf = s.sendbuf
         buf === nothing && break
         totb = bytesavailable(buf) + n
         if totb < buf.maxsize
             nb = unsafe_write(buf, p, n)
-            #iolock_end()
+            iolock_end(tcp)
             return nb
         end
         bytesavailable(buf) == 0 && break
@@ -1254,7 +1254,7 @@ function Base.unsafe_write(s::TCPSocket, p::Ptr{UInt8}, n::UInt)
 end
 
 function Base.flush(s::TCPSocket)
-    #iolock_begin()
+    iolock_begin(tcp)
     buf = s.sendbuf
     if buf !== nothing
         if bytesavailable(buf) > 0
@@ -1269,22 +1269,22 @@ end
 
 function Base.buffer_writes(s::TCPSocket, bufsize)
     sendbuf = PipeBuffer(bufsize)
-    #iolock_begin()
+    iolock_begin(tcp)
     s.sendbuf = sendbuf
-    #iolock_end()
+    iolock_end(tcp)
     return s
 end
 
 function Base.write(s::TCPSocket, b::UInt8)
     buf = s.sendbuf
     if buf !== nothing
-        #iolock_begin()
+        iolock_begin(tcp)
         if bytesavailable(buf) + 1 < buf.maxsize
             n = write(buf, b)
-            #iolock_end()
+            iolock_end(tcp)
             return n
         end
-        #iolock_end()
+        iolock_end(tcp)
     end
     return write(s, Ref{UInt8}(b))
 end
