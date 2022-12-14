@@ -1,7 +1,8 @@
 ## LIBUV ##
 ifneq ($(USE_BINARYBUILDER_LIBUV),1)
-LIBUV_GIT_URL:=https://github.com/JuliaLang/libuv.git
+LIBUV_GIT_URL:=https://github.com/vustef/libuv.git
 LIBUV_TAR_URL=https://api.github.com/repos/JuliaLang/libuv/tarball/$1
+
 $(eval $(call git-external,libuv,LIBUV,configure,,$(SRCCACHE)))
 
 UV_CFLAGS := -O2
@@ -55,6 +56,7 @@ fastcheck-libuv: #none
 check-libuv: $(LIBUV_BUILDDIR)/build-checked
 
 else # USE_BINARYBUILDER_LIBUV
+
 
 $(eval $(call bb-install,libuv,LIBUV,false))
 

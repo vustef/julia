@@ -39,6 +39,8 @@ static void jl_signal_async_cb(uv_async_t *hdl)
     uv_stop(jl_io_loop);
 }
 
+static void locker_cb(uv_loop_t* loop, uv_looplock_mode mode);
+
 void jl_wake_libuv(void)
 {
     uv_async_send(&signal_async);
@@ -49,6 +51,7 @@ jl_mutex_t jl_uv_mutex;
 void jl_init_uv(void)
 {
     uv_async_init(jl_io_loop, &signal_async, jl_signal_async_cb);
+    jl_io_loop->looplock_cb = locker_cb;
     JL_MUTEX_INIT(&jl_uv_mutex); // a file-scope initializer can be used instead
 }
 
@@ -75,6 +78,14 @@ JL_DLLEXPORT void jl_iolock_begin(void)
 JL_DLLEXPORT void jl_iolock_end(void)
 {
     JL_UV_UNLOCK();
+}
+
+static void locker_cb(uv_loop_t* loop, uv_looplock_mode mode) {
+  if(mode == UV_LOOP_LOCK)
+    jl_iolock_begin();
+  else {
+    jl_iolock_end();
+  }
 }
 
 
