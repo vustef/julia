@@ -654,7 +654,8 @@ function uv_readcb(handle::Ptr{Cvoid}, nread::Cssize_t, buf::Ptr{Cvoid})
     stream_unknown_type = @handle_as handle LibuvStream
     nrequested = ccall(:jl_uv_buf_len, Csize_t, (Ptr{Cvoid},), buf)
     function readcb_specialized(stream::LibuvStream, nread::Int, nrequested::UInt)
-        lock(stream.cond)
+        lock(stream.cond) # TODO @vustef: Would need to make sure that this lock is not held when we unlock iolock, to avoid deadlocks.
+        # TODO @vustef: nested iolocks, or invoking libuv from callback, might also be a problem.
         if nread < 0
             if nread == UV_ENOBUFS && nrequested == 0
                 # remind the client that stream.buffer is full

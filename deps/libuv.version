@@ -1,2 +1,2 @@
 LIBUV_BRANCH=julia-uv2-1.44.2-vs-unlock-cb
-LIBUV_SHA1=a82eb537cffda95cc97dc7a89c2f7ac7a3e185ff
+LIBUV_SHA1=ccd744c33319fc7373b0b6edbaa0c12ec28dca35
